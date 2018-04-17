@@ -4,7 +4,7 @@
 
         欲流之远者，必浚其泉源。A2DP 必须能读取到 Audio data 数据流（PCM格式），才能谈编码，我们就先来看看A2DP 数据从何而来。
 
-### 1. Audio data 来源
+### 1.1 Audio data 来源
 
         熟悉Android 架构就会比较了解，Audio data 由 Audio flinger 将上层所有音频源进行合成为一路后输出，在 A2DP 不工作的时候，会直接通过 tinyalsa 接口写入声卡驱动进行发声。当BT A2DP audio设备存在时，音频会优先将 Audio data写入 A2DP，然而 Audio flinger 与 A2DP（or Bluetooth） 运行在不同的进程空间，要进行数据交互，必然用到进程间通信。
 
@@ -96,11 +96,11 @@ ipc, tUIPC_CH_ID ch_id, tUIPC_RCV_CBACK* p_cback,
 
  ​       至于 Bluedroid中是在何处处理 data 和 command的，请看上文提到的函数 btif\_a2dp\_recv\_ctrl\_data，从命名可知，此函数即是用于处理 Audio 的命令，Audio data呢，请参考1.4小姐节。
 
-### 2. Audio command 来源
+### 1.2 Audio command 来源
 
  ​       前面以A2DP\_DATA\_PATH为线索分析了 Audio data的来源，，还剩下一个 A2DP\_CTRL\_PATH，以 A2DP\_CTRL\_PATH 为线索就能摸清 command的来源了。
 
-### 3. Audio data 写入的实现
+### 1.3 Audio data 写入的实现
 
 audio.a2dp.default.so 作为一个 HAL 动态链接库，必须遵循 Android HAL 设计规则。HAL 设计了统一的硬件抽象层接口，任何一个标准的硬件抽象，必须实现此接口。
 
@@ -251,7 +251,7 @@ struct audio_hw_device {
 {% endcode-tabs-item %}
 {% endcode-tabs %}
 
-其实不难猜到，Audio 模块基于 hw\_device\_t 定义了 audio\_hw\_device，并且将 hw\_device\_t common 设置为其第一个域。然后又扩展了很多自定义函数指针，例如get\_supported\_devices，adev\_set\_voice\_volume等。
+其实不难猜到，Audio 模块基于 hw\_device\_t 定义了 audio\_hw\_device，并且将 hw\_device\_t 设置为其第一个域。然后又扩展了很多自定义函数指针，例如get\_supported\_devices，adev\_set\_voice\_volume等。
 
 注意到在 adev\_open最后：
 
@@ -290,7 +290,6 @@ if (err == 0) {
 
 ```cpp
   adev->device.open_output_stream = adev_open_output_stream;
-
 ```
 
 open\_output\_stream 指向 本地（audio\_a2dp）adev\_open\_output\_stream函数：
@@ -447,13 +446,13 @@ static int start_audio_datapath(struct ha_stream_common* common) {
 
 正是在每次 out\_write的时候，都会检查是否 audio\_fd 处于 DISCONNECTED 状态，是则会建立到 socket server端的连接，打通通信通道。
 
-### 4. Audio commad 写入的实现
+### 1.4 Audio commad 写入的实现
 
 由于 command 写入与data 写入大体相似，不再敖述。
 
 ## 二、A2DP 中 Audio data 的处理过程
 
-### 1. Audio data 的读取实现
+### 2.1 Audio data 的读取实现
 
 1.1中提到 btif\_a2dp\_recv\_ctrl\_data 函数打开了 data 通道，然而并没有跟踪其 read过程。
 
@@ -529,19 +528,517 @@ static void btif_a2dp_source_setup_codec_delayed(
 
 后面将不再采取引导式书写，也不再提及代码跟踪方式，将直接引出核心代码进行说明。
 
-### 2. Audio command 的读取
+### 2.2 Audio command 的读取
 
 略
 
-## 三、编码流程
+## 三、A2DP 编码器
 
-### 1. 编码器调度流程
+Android O 在 SBC 和 AAC 的基础上新增了 APTX、LDAC，并且采用 C++ 语言进行重构，使用面向对象的编程思想对编码器进行了抽象和实现。
 
+### 3.1 编码器抽象接口
 
+2.1中有提到 encoder\_init 会传入读取 Audio data 的callback 方法进去，然后应该是通过 send\_frames 进行数据读取、编码、发送到HCI。
 
+{% code-tabs %}
+{% code-tabs-item title="a2dp\_codec\_api.h" %}
+```cpp
+//
+// A2DP encoder callbacks interface.
+//
+typedef struct {
+  // Initialize the A2DP encoder.
+  // |p_peer_params| contains the A2DP peer information
+  // The current A2DP codec config is in |a2dp_codec_config|.
+  // |read_callback| is the callback for reading the input audio data.
+  // |enqueue_callback| is the callback for enqueueing the encoded audio data.
+  void (*encoder_init)(const tA2DP_ENCODER_INIT_PEER_PARAMS* p_peer_params,
+                       A2dpCodecConfig* a2dp_codec_config,
+                       a2dp_source_read_callback_t read_callback,
+                       a2dp_source_enqueue_callback_t enqueue_callback);
 
+  // Cleanup the A2DP encoder.
+  void (*encoder_cleanup)(void);
 
-### 2. SBC 编码流程
+  // Reset the feeding for the A2DP encoder.
+  void (*feeding_reset)(void);
+
+  // Flush the feeding for the A2DP encoder.
+  void (*feeding_flush)(void);
+
+  // Get the A2DP encoder interval (in milliseconds).
+  period_ms_t (*get_encoder_interval_ms)(void);
+
+  // Prepare and send A2DP encoded frames.
+  // |timestamp_us| is the current timestamp (in microseconds).
+  void (*send_frames)(uint64_t timestamp_us);
+
+  // Set transmit queue length for the A2DP encoder.
+  void (*set_transmit_queue_length)(size_t transmit_queue_length);
+} tA2DP_ENCODER_INTERFACE;
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="a2dp\_codec\_api.h" %}
+```cpp
+static const tA2DP_ENCODER_INTERFACE a2dp_encoder_interface_sbc = {
+    a2dp_sbc_encoder_init,
+    a2dp_sbc_encoder_cleanup,
+    a2dp_sbc_feeding_reset,
+    a2dp_sbc_feeding_flush,
+    a2dp_sbc_get_encoder_interval_ms,
+    a2dp_sbc_send_frames,
+    nullptr  // set_transmit_queue_length
+};
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+编码器被抽象为 tA2DP\_ENCODER\_INTERFACE 结构体（结构体类大量定义函数指针，实际上可以称为一个 C++ 类了）。那么该编码接口是如何使用的呢？我们以SBC 为例来看下一小节。
+
+### 3.2 编码器调度流程
+
+#### 3.2.2 a2dp\_sbc\_encoder\_init
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_source.cc" %}
+```cpp
+static void btif_a2dp_source_setup_codec_delayed(
+    const RawAddress& peer_address) {
+  ...
+  // 1 获取 encoder接口
+  btif_a2dp_source_cb.encoder_interface = bta_av_co_get_encoder_interface();
+  if (btif_a2dp_source_cb.encoder_interface == nullptr) {
+    LOG_ERROR(LOG_TAG, "%s: Cannot stream audio: no source encoder interface",
+              __func__);
+    return;
+  }
+
+  // 2 获取 encoder 配置
+  A2dpCodecConfig* a2dp_codec_config = bta_av_get_a2dp_current_codec();
+  if (a2dp_codec_config == nullptr) {
+    LOG_ERROR(LOG_TAG, "%s: Cannot stream audio: current codec is not set",
+              __func__);
+    return;
+  }
+  // 3 初始化 encoder，并且传入了读取 audio data的callback方法
+  btif_a2dp_source_cb.encoder_interface->encoder_init(
+      &peer_params, a2dp_codec_config, btif_a2dp_source_read_callback,
+      btif_a2dp_source_enqueue_callback);
+
+  // 4 获取 encoder 应该调用的周期
+  // Save a local copy of the encoder_interval_ms
+  btif_a2dp_source_cb.encoder_interval_ms =
+      btif_a2dp_source_cb.encoder_interface->get_encoder_interval_ms();
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_source.cc" %}
+```cpp
+void btif_a2dp_source_setup_codec(const RawAddress& peer_address) {
+  LOG_INFO(LOG_TAG, "%s: peer_address=%s", __func__,
+           peer_address.ToString().c_str());
+
+  // Check to make sure the platform has 8 bits/byte since
+  // we're using that in frame size calculations now.
+  CHECK(CHAR_BIT == 8);
+
+  btif_a2dp_source_thread.DoInThread(
+      FROM_HERE,
+      base::Bind(&btif_a2dp_source_setup_codec_delayed, peer_address));
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_av.cc" %}
+```cpp
+bool BtifAvStateMachine::StateOpened::ProcessEvent(uint32_t event,
+                                                   void* p_data) {
+  ...                                                 
+  switch (event) {
+    case BTIF_AV_STOP_STREAM_REQ_EVT:
+    case BTIF_AV_SUSPEND_STREAM_REQ_EVT:
+    case BTIF_AV_ACL_DISCONNECTED:
+      break;  // Ignore
+
+    case BTIF_AV_START_STREAM_REQ_EVT:
+      if (peer_.IsSink()) {
+        btif_a2dp_source_setup_codec(peer_.PeerAddress());
+      }
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+来看看 BTIF\_AV\_START\_STREAM\_REQ\_EVT 是在哪里发起的：
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_ac.cc" %}
+```cpp
+void btif_av_stream_start(void) {
+  btif_av_source_dispatch_sm_event(btif_av_source_active_peer(),
+                                   BTIF_AV_START_STREAM_REQ_EVT);
+}
+
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+而btif\_av\_stream\_start 有两处调用：
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_control.cc" %}
+```cpp
+static void btif_a2dp_recv_ctrl_data(void) {
+  tA2DP_CTRL_CMD cmd = A2DP_CTRL_CMD_NONE;
+  int n;
+
+  uint8_t read_cmd = 0; /* The read command size is one octet */
+  n = UIPC_Read(*a2dp_uipc, UIPC_CH_ID_AV_CTRL, NULL, &read_cmd, 1);
+  cmd = static_cast<tA2DP_CTRL_CMD>(read_cmd);
+  ...
+  switch (cmd) {
+    ...
+    case A2DP_CTRL_CMD_START:
+      ...
+      if (btif_av_stream_ready()) {
+        /* Setup audio data channel listener */
+        UIPC_Open(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb,
+                  A2DP_DATA_PATH);
+
+        /*
+         * Post start event and wait for audio path to open.
+         * If we are the source, the ACK will be sent after the start
+         * procedure is completed, othewise send it now.
+         */
+        btif_av_stream_start();
+        if (btif_av_get_peer_sep() == AVDT_TSEP_SRC)
+          btif_a2dp_command_ack(A2DP_CTRL_ACK_SUCCESS);
+        break;
+      }
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+所以其一是收到 Audio 的 START command 会开始初始化 encoder。再看另一处：
+
+```cpp
+uint8_t btif_a2dp_audio_process_request(uint8_t cmd) {
+  APPL_TRACE_DEBUG(LOG_TAG, "%s: cmd: %s", __func__,
+                   audio_a2dp_hw_dump_ctrl_event((tA2DP_CTRL_CMD)cmd));
+  a2dp_cmd_pending = cmd;
+  uint8_t status;
+  switch (cmd) {
+    case A2DP_CTRL_CMD_START:
+      ...
+      if (btif_av_stream_ready()) {
+        /*
+         * Post start event and wait for audio path to open.
+         * If we are the source, the ACK will be sent after the start
+         * procedure is completed, othewise send it now.
+         */
+        btif_av_stream_start();
+        if (btif_av_get_peer_sep() == AVDT_TSEP_SRC) {
+          status = A2DP_CTRL_ACK_SUCCESS;
+          break;
+        }
+        /*Return pending and ack when start stream cfm received from remote*/
+        status = A2DP_CTRL_ACK_PENDING;
+        break;
+      }
+```
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_audio\_interface.cc" %}
+```cpp
+void btif_a2dp_audio_send_start_req() {
+  LOG_INFO(LOG_TAG, "%s", __func__);
+  uint8_t resp;
+  resp = btif_a2dp_audio_process_request(A2DP_CTRL_CMD_START);
+  if (btAudio != nullptr) {
+    auto ret = btAudio->streamStarted(mapToStatus(resp));
+    if (!ret.isOk()) LOG_ERROR(LOG_TAG, "HAL server died");
+  }
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_audio\_interface.cc" %}
+```cpp
+class BluetoothAudioHost : public IBluetoothAudioHost {
+ public:
+  Return<void> startStream() {
+    btif_a2dp_audio_send_start_req();
+    return Void();
+  }
+  Return<void> suspendStream() {
+    btif_a2dp_audio_send_suspend_req();
+    return Void();
+  }
+  Return<void> stopStream() {
+    btif_a2dp_audio_process_request(A2DP_CTRL_CMD_STOP);
+    return Void();
+  }
+
+};
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+然而并不见startStream的调用，可能是未完善的功能，就到此为止。
+
+#### 3.2.2 send\_frames 接口
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_source.cc" %}
+```cpp
+static void btif_a2dp_source_audio_handle_timer(void) {
+  if (btif_av_is_a2dp_offload_enabled()) return;
+
+  ...
+  if (btif_a2dp_source_cb.encoder_interface->set_transmit_queue_length !=
+      nullptr) {
+    btif_a2dp_source_cb.encoder_interface->set_transmit_queue_length(
+        transmit_queue_length);
+  }
+  btif_a2dp_source_cb.encoder_interface->send_frames(timestamp_us);
+  bta_av_ci_src_data_ready(BTA_AV_CHNL_AUDIO);
+  update_scheduling_stats(&btif_a2dp_source_cb.stats.tx_queue_enqueue_stats,
+                          timestamp_us,
+                          btif_a2dp_source_cb.encoder_interval_ms * 1000);
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_source.cc" %}
+```cpp
+static void btif_a2dp_source_alarm_cb(UNUSED_ATTR void* context) {
+  btif_a2dp_source_thread.DoInThread(
+      FROM_HERE, base::Bind(&btif_a2dp_source_audio_handle_timer));
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_source.cc" %}
+```cpp
+static void btif_a2dp_source_audio_tx_start_event(void) {
+  LOG_INFO(LOG_TAG, "%s: media_alarm is %srunning, streaming %s", __func__,
+           alarm_is_scheduled(btif_a2dp_source_cb.media_alarm) ? "" : "not ",
+           btif_a2dp_source_is_streaming() ? "true" : "false");
+
+  if (btif_av_is_a2dp_offload_enabled()) return;
+
+  /* Reset the media feeding state */
+  CHECK(btif_a2dp_source_cb.encoder_interface != nullptr);
+  btif_a2dp_source_cb.encoder_interface->feeding_reset();
+
+  APPL_TRACE_EVENT(
+      "%s: starting timer %" PRIu64 " ms", __func__,
+      btif_a2dp_source_cb.encoder_interface->get_encoder_interval_ms());
+  alarm_free(btif_a2dp_source_cb.media_alarm);
+  btif_a2dp_source_cb.media_alarm =
+      alarm_new_periodic("btif.a2dp_source_media_alarm");
+  if (btif_a2dp_source_cb.media_alarm == nullptr) {
+    LOG_ERROR(LOG_TAG, "%s: unable to allocate media alarm", __func__);
+    return;
+  }
+
+  alarm_set(btif_a2dp_source_cb.media_alarm,
+            btif_a2dp_source_cb.encoder_interface->get_encoder_interval_ms(),
+            btif_a2dp_source_alarm_cb, nullptr);
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+可见 send\_frames 是在一个定时器下周期性运行，不难理解 encoder 需要周期性的读取 Audio data 进行编码，并且发送到 HCI。此周期就是在get\_encoder\_interval\_ms  中设置，来看看 SBC中此设置：
+
+{% code-tabs %}
+{% code-tabs-item title="a2dp\_sbc\_encoder.cc" %}
+```cpp
+period_ms_t a2dp_sbc_get_encoder_interval_ms(void) {
+  return A2DP_SBC_ENCODER_INTERVAL_MS;
+}
+
+// A2DP SBC encoder interval in milliseconds.
+#define A2DP_SBC_ENCODER_INTERVAL_MS 20
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+所以 SBC encoder 以20ms为周期进行编码。再继续跟一下 btif\_a2dp\_source\_audio\_tx\_start\_event 的调用者：
+
+```cpp
+void btif_a2dp_source_start_audio_req(void) {
+  LOG_INFO(LOG_TAG, "%s", __func__);
+
+  btif_a2dp_source_thread.DoInThread(
+      FROM_HERE, base::Bind(&btif_a2dp_source_audio_tx_start_event));
+  btif_a2dp_source_cb.stats.Reset();
+  // Assign session_start_us to 1 when time_get_os_boottime_us() is 0 to
+  // indicate btif_a2dp_source_start_audio_req() has been called
+  btif_a2dp_source_cb.stats.session_start_us = time_get_os_boottime_us();
+  if (btif_a2dp_source_cb.stats.session_start_us == 0) {
+    btif_a2dp_source_cb.stats.session_start_us = 1;
+  }
+  btif_a2dp_source_cb.stats.session_end_us = 0;
+}
+```
+
+{% code-tabs %}
+{% code-tabs-item title="btif\_a2dp\_control.cc" %}
+```cpp
+static void btif_a2dp_data_cb(UNUSED_ATTR tUIPC_CH_ID ch_id,
+                              tUIPC_EVENT event) {
+  APPL_TRACE_WARNING("%s: BTIF MEDIA (A2DP-DATA) EVENT %s", __func__,
+                     dump_uipc_event(event));
+
+  switch (event) {
+    case UIPC_OPEN_EVT:
+      /*
+       * Read directly from media task from here on (keep callback for
+       * connection events.
+       */
+      UIPC_Ioctl(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO,
+                 UIPC_REG_REMOVE_ACTIVE_READSET, NULL);
+      UIPC_Ioctl(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO, UIPC_SET_READ_POLL_TMO,
+                 reinterpret_cast<void*>(A2DP_DATA_READ_POLL_MS));
+
+      if (btif_av_get_peer_sep() == AVDT_TSEP_SNK) {
+        /* Start the media task to encode the audio */
+        btif_a2dp_source_start_audio_req();
+      }
+
+      /* ACK back when media task is fully started */
+      break;
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+```cpp
+static void btif_a2dp_recv_ctrl_data(void) {
+  tA2DP_CTRL_CMD cmd = A2DP_CTRL_CMD_NONE;
+  int n;
+
+  uint8_t read_cmd = 0; /* The read command size is one octet */
+  n = UIPC_Read(*a2dp_uipc, UIPC_CH_ID_AV_CTRL, NULL, &read_cmd, 1);
+  cmd = static_cast<tA2DP_CTRL_CMD>(read_cmd);
+ ​ ...
+  switch (cmd) {
+ ​   ...
+    case A2DP_CTRL_CMD_START:
+      /*
+       * Don't send START request to stack while we are in a call.
+       * Some headsets such as "Sony MW600", don't allow AVDTP START
+       * while in a call, and respond with BAD_STATE.
+       */
+      if (!bluetooth::headset::IsCallIdle()) {
+        btif_a2dp_command_ack(A2DP_CTRL_ACK_INCALL_FAILURE);
+        break;
+      }
+
+      if (btif_a2dp_source_is_streaming()) {
+        APPL_TRACE_WARNING("%s: A2DP command %s while source is streaming",
+                           __func__, audio_a2dp_hw_dump_ctrl_event(cmd));
+        btif_a2dp_command_ack(A2DP_CTRL_ACK_FAILURE);
+        break;
+      }
+
+      if (btif_av_stream_ready()) {
+        /* Setup audio data channel listener */
+        UIPC_Open(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb,
+                  A2DP_DATA_PATH);
+```
+
+{% code-tabs %}
+{% code-tabs-item title="uipc.cc" %}
+```cpp
+static int uipc_check_fd_locked(tUIPC_STATE& uipc, tUIPC_CH_ID ch_id) {
+  if (ch_id >= UIPC_CH_NUM) return -1;
+
+  // BTIF_TRACE_EVENT("CHECK SRVFD %d (ch %d)", uipc.ch[ch_id].srvfd,
+  // ch_id);
+
+  if (SAFE_FD_ISSET(uipc.ch[ch_id].srvfd, &uipc.read_set)) {
+    BTIF_TRACE_EVENT("INCOMING CONNECTION ON CH %d", ch_id);
+    ...
+    uipc.ch[ch_id].fd = accept_server_socket(uipc.ch[ch_id].srvfd);
+    ...
+    if (uipc.ch[ch_id].cback) uipc.ch[ch_id].cback(ch_id, UIPC_OPEN_EVT);
+  }
+  ...
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+发现在 UIPC\_Open Data channel 的时候，传入 btif\_a2dp\_data\_cb，而UIPC\_OPEN\_EVT 是在 uipc\_check\_fd\_locked 中发出的，那么是在什么条件下会产生 UIPC\_OPEN\_EVT？请注意 uipc\_check\_fd\_locked 中调用了 accept\_server\_socket，我们已经知道 Bluedroid A2DP 是socket server，意味着此处一定是有 client connect 过来，才会有 socket server accept，请看 connect：
+
+{% code-tabs %}
+{% code-tabs-item title="audio\_a2dp\_hw.cc" %}
+```cpp
+
+static int start_audio_datapath(struct a2dp_stream_common* common) {
+  INFO("state %d", common->state);
+  ...
+  int a2dp_status = a2dp_command(common, A2DP_CTRL_CMD_START);
+  ...
+  /* connect socket if not yet connected */
+  if (common->audio_fd == AUDIO_SKT_DISCONNECTED) {
+    common->audio_fd = skt_connect(A2DP_DATA_PATH, common->buffer_sz);
+    if (common->audio_fd < 0) {
+      ERROR("Audiopath start failed - error opening data socket");
+      goto error;
+    }
+  }
+  ...
+}
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+```cpp
+static ssize_t out_write(struct audio_stream_out* stream, const void* buffer,
+                         size_t bytes) {
+  ...
+  /* only allow autostarting if we are in stopped or standby */
+  if ((out->common.state == AUDIO_A2DP_STATE_STOPPED) ||
+      (out->common.state == AUDIO_A2DP_STATE_STANDBY)) {
+    if (start_audio_datapath(&out->common) < 0) {
+      goto finish;
+    }
+  } else if (out->common.state != AUDIO_A2DP_STATE_STARTED) {
+    ERROR("stream not in stopped or standby");
+    goto finish;
+  }
+```
+
+请注意到在连接 skt\_connect 之前 发送了 A2DP\_CTRL\_CMD\_START 命令。
+
+总结下本小节编码器的调度流程就是：
+
+1. Audio 调用 audio\_a2dp 库中的 out\_write 函数开始写入 Audio data
+2. audio\_a2dp 发送 A2DP\_CTRL\_CMD\_START
+3. Bluedroid a2dp 收到 A2DP\_CTRL\_CMD\_START，创建 socket server
+4. audio\_a2dp 连接 socket server \(data channel\)
+5. UIPC accept此连接，并回调 Bluetooth a2dp 中 btif\_a2dp\_data\_cb
+6. btif\_a2dp\_data\_cb回调函数经过层层调用，开启20ms的周期性定时器
+7. 在定时器的 handler 中调用 send\_frames
+8. send\_frames 进行编码，发送给 HCI
+
+### 3.3 SBC 编码流程
 
 
 
