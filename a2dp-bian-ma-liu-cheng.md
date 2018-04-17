@@ -1,6 +1,6 @@
 # A2DP SBC 编码流程
 
-## A2DP与音频的接口
+## 一、A2DP 与 Audio 的接口
 
         欲流之远者，必浚其泉源。A2DP 必须能读取到 Audio data 数据流（PCM格式），才能谈编码，我们就先来看看A2DP 数据从何而来。
 
@@ -90,17 +90,17 @@ ipc, tUIPC_CH_ID ch_id, tUIPC_RCV_CBACK* p_cback,
 
 关键函数 uipc\_setup\_server\_locked证明此处 UIPC\_Open确实是在建立 server socket，可这就奇怪了,明明是要用 socket 进行进程间通信，可为何 client 和 server 端都在 Bluedroid A2DP之中？
 
-        进一步分析不难发现，audio\_a2dp\_hw 这个目录被单独编译成一个动态链接库，而此库应该是运行在 Audio 进程空间，从该目录的 Android.bp 文件可以看出这一点。大概是为了解耦和方便维护，将 原本应该运行在 Audio 端的 socket client放在 Bluedroid 端实现，前面也有提到，实际上 Audio 只关心接口，任何一个实现了 Audio 接口的动态库都可以被加载到 Audio进程空间获取 Audio data，当然前提是此库：audio.xxxx.default.so 中 xxxx 是 Audio 中注册的一个设备吧。
+        进一步分析不难发现，audio\_a2dp\_hw 这个目录被单独编译成一个动态链接库，而此库应该是运行在 Audio 进程空间，从该目录的 Android.bp 文件可以看出这一点。大概是为了解耦和方便维护，将原本应该运行在 Audio 端的 socket client放在 Bluedroid 端实现，前面也有提到，实际上 Audio 只关心接口，任何一个实现了 Audio 接口的动态库都可以被加载到 Audio进程空间获取 Audio data，当然前提是此库：audio.xxxx.default.so 中 xxxx 是 Audio 中注册的一个设备吧。
 
          到此已经很清楚 Audio data的来源了：Bluedroid提供一个动态链接库给Audio，当A2DP工作时，Audio会直接通过此库中 socket client 进行 socket 连接和data 发送，那么 Bluedroid A2DP中同名 socket server 就能收到 Audio data数据了。
 
- ​       至于 Bluedroid中是在何处处理 data 和 command的，请看上文提到的函数 btif\_a2dp\_recv\_ctrl\_data，从命名可知，此函数即是用于处理 Audio 的命令，Audio data呢，则在 UIPC\_Open的第三个参数 btif\_a2dp\_data\_cb -----回调函数中处理。
+ ​       至于 Bluedroid中是在何处处理 data 和 command的，请看上文提到的函数 btif\_a2dp\_recv\_ctrl\_data，从命名可知，此函数即是用于处理 Audio 的命令，Audio data呢，请参考1.4小姐节。
 
 ### 2. Audio command 来源
 
  ​       前面以A2DP\_DATA\_PATH为线索分析了 Audio data的来源，，还剩下一个 A2DP\_CTRL\_PATH，以 A2DP\_CTRL\_PATH 为线索就能摸清 command的来源了。
 
-### 3. Audio A2DP 的实现
+### 3. Audio data 写入的实现
 
 audio.a2dp.default.so 作为一个 HAL 动态链接库，必须遵循 Android HAL 设计规则。HAL 设计了统一的硬件抽象层接口，任何一个标准的硬件抽象，必须实现此接口。
 
@@ -446,6 +446,106 @@ static int start_audio_datapath(struct ha_stream_common* common) {
 ```
 
 正是在每次 out\_write的时候，都会检查是否 audio\_fd 处于 DISCONNECTED 状态，是则会建立到 socket server端的连接，打通通信通道。
+
+### 4. Audio commad 写入的实现
+
+由于 command 写入与data 写入大体相似，不再敖述。
+
+## 二、A2DP 中 Audio data 的处理过程
+
+### 1. Audio data 的读取实现
+
+1.1中提到 btif\_a2dp\_recv\_ctrl\_data 函数打开了 data 通道，然而并没有跟踪其 read过程。
+
+```cpp
+static void btif_a2dp_recv_ctrl_data(void) { 
+...
+    if (btif_av_stream_ready()) {
+        /* Setup audio data channel listener */
+        UIPC_Open(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb,
+                  A2DP_DATA_PATH);
+    }
+    ...
+}
+```
+
+UIPC\_Open 既可以打开 data path， 也可以打开 ctrl apth：
+
+```cpp
+void btif_a2dp_control_init(void) {
+  a2dp_uipc = UIPC_Init();
+  UIPC_Open(*a2dp_uipc, UIPC_CH_ID_AV_CTRL, btif_a2dp_ctrl_cb, A2DP_CTRL_PATH);
+}
+```
+
+分辨的方式就是第二个参数：
+
+*  UIPC\_CH\_ID\_AV\_CTRL
+*  UIPC\_CH\_ID\_AV\_AUDIO
+
+分别用于标识控制通道和数据通道，并且 UIPC 封装了对每个channel 打开、关闭、读取、写入的方法。所以要想知道 A2DP 是如何读取 Audio data的，就需要找到 UIPC\_read（UIPC\_CH\_ID\_AV\_AUDIO）的地方：
+
+```cpp
+static uint32_t btif_a2dp_source_read_callback(uint8_t* p_buf, uint32_t len) {
+  uint16_t event;
+  uint32_t bytes_read =
+      UIPC_Read(*a2dp_uipc, UIPC_CH_ID_AV_AUDIO, &event, p_buf, len);
+
+  if (bytes_read < len) {
+    LOG_WARN(LOG_TAG, "%s: UNDERFLOW: ONLY READ %d BYTES OUT OF %d", __func__,
+             bytes_read, len);
+    btif_a2dp_source_cb.stats.media_read_total_underflow_bytes +=
+        (len - bytes_read);
+    btif_a2dp_source_cb.stats.media_read_total_underflow_count++;
+    btif_a2dp_source_cb.stats.media_read_last_underflow_us =
+        time_get_os_boottime_us();
+  }
+
+  return bytes_read;
+}
+```
+
+从函数命名上，很像是读取方法：
+
+```cpp
+static void btif_a2dp_source_setup_codec_delayed(
+    const RawAddress& peer_address) {
+ ​ ...
+  btif_a2dp_source_cb.encoder_interface = bta_av_co_get_encoder_interface();
+  if (btif_a2dp_source_cb.encoder_interface == nullptr) {
+    LOG_ERROR(LOG_TAG, "%s: Cannot stream audio: no source encoder interface",
+              __func__);
+    return;
+  }
+ ​ ...
+  btif_a2dp_source_cb.encoder_interface->encoder_init(
+      &peer_params, a2dp_codec_config, btif_a2dp_source_read_callback,
+      btif_a2dp_source_enqueue_callback);
+  ... ​ 
+}
+```
+
+以上代码表明，在进行编码器初始化 encoder\_init 的时候就将btif\_a2dp\_source\_read\_callback 作为 Audiod data 的读取接口,传入 encoder 中了，所以实际读取的动作，是在各个编码器中发生。
+
+后面将不再采取引导式书写，也不再提及代码跟踪方式，将直接引出核心代码进行说明。
+
+### 2. Audio command 的读取
+
+略
+
+## 三、编码流程
+
+### 1. 编码器调度流程
+
+
+
+
+
+### 2. SBC 编码流程
+
+
+
+
 
 
 
