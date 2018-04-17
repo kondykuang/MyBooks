@@ -1,4 +1,4 @@
-# A2DP 编码流程
+# SBC Encode Flow
 
 
 
