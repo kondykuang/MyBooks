@@ -96,6 +96,12 @@ ipc, tUIPC_CH_ID ch_id, tUIPC_RCV_CBACK* p_cback,
 
  ​       至于 Bluedroid中是在何处处理 data 和 command的，请看上文提到的函数 btif\_a2dp\_recv\_ctrl\_data，从命名可知，此函数即是用于处理 Audio 的命令，Audio data呢，则在 UIPC\_Open的第三个参数 btif\_a2dp\_data\_cb -----回调函数中处理。
 
+1.1分无分文
+
+#### 1.1 分为非w分我 
+
+#### 1.2 分为非仍无法我
+
 ### 2. Audio command 来源
 
  ​       前面以A2DP\_DATA\_PATH为线索分析了 Audio data的来源，，还剩下一个 A2DP\_CTRL\_PATH，以 A2DP\_CTRL\_PATH 为线索就能摸清 command的来源了。
@@ -225,18 +231,48 @@ static int adev_open(const hw_module_t* module, const char* name,
 {% endcode-tabs-item %}
 {% endcode-tabs %}
 
-adev\_open 参数是按照 HAL规约写成，但是其实现中，
-
-
-
-
-
-以 GPS JNI 为例 简要看看 HAL 库的事使用方法：
+adev\_open 参数是按照 HAL规约写成，但是其实现中，定义了一个 a2dp\_audio\_device 对象， 并且为它分配了内存，然后进行了很多函数指针赋值。来看看a2dp\_audio\_device定义：
 
 ```cpp
+struct a2dp_audio_device {
+  // Important: device must be first as an audio_hw_device* may be cast to
+  // a2dp_audio_device* when the type is implicitly known.
+  struct audio_hw_device device;
+  std::recursive_mutex* mutex;  // See note below on mutex acquisition order.
+  struct a2dp_stream_in* input;
+  struct a2dp_stream_out* output;
+};
+```
+
+a2dp\_audio\_device封装了 audio\_hw\_device ：
+
+{% code-tabs %}
+{% code-tabs-item title="audio.h" %}
+```cpp
+struct audio_hw_device {
+    struct hw_device_t common;
+    uint32_t (*get_supported_devices)(const struct audio_hw_device *dev);
+    int (*init_check)(const struct audio_hw_device *dev);
+```
+{% endcode-tabs-item %}
+{% endcode-tabs %}
+
+其实不难猜到，Audio 模块基于 hw\_device\_t 定义了 audio\_hw\_device，并且将 hw\_device\_t common 设置为其第一个域。然后又扩展了很多自定义函数指针，例如get\_supported\_devices，adev\_set\_voice\_volume等。
+
+注意到在 adev\_open最后：
+
+```cpp
+*device = &adev->device.common;
+```
+
+将adev-&gt;device.common 赋值给 device，也就是将a2dp\_audio\_device中 hw\_device\_t common 赋值给了函数参数的 hw\_devie\_t device。为什么有这样的操作，来看看 HAL 库是如何使用的就清楚了。以 GPS JNI 为例 简要看看 HAL 库的事使用方法：
+
+```cpp
+// 通过 hw_get_module 获取指定 HAL 库的 hw_module_t
 err = hw_get_module(GPS_HARDWARE_MODULE_ID, (hw_module_t const**)&module);
 if (err == 0) {
     hw_device_t* device;
+// 通过 hw_module_t
     err = module->methods->open(module, GPS_HARDWARE_MODULE_ID, &device);
     if (err == 0) {
         gps_device_t* gps_device = (gps_device_t *)device;
@@ -244,6 +280,14 @@ if (err == 0) {
     }
 }
 
+```
+
+```cpp
+   err = module->methods->open(module, GPS_HARDWARE_MODULE_ID, &device);
+    if (err == 0) {
+        gps_device_t* gps_device = (gps_device_t *)device;
+        sGpsInterface = gps_device->get_gps_interface(gps_device);
+    }
 ```
 
 
