@@ -8,7 +8,7 @@
 
         熟悉Android 架构就会比较了解，Audio data 由 Audio flinger 将上层所有音频源进行合成为一路后输出，在 A2DP 不工作的时候，会直接通过 tinyalsa 接口写入声卡驱动进行发声。当BT A2DP audio设备存在时，音频会优先将 Audio data写入 A2DP，然而 Audio flinger 与 A2DP（or Bluetooth） 运行在不同的进程空间，要进行数据交互，必然用到进程间通信。
 
-        打开 Bluedroid 代码目录，第一个文件夹的名称 audio\_a2dp\_hw 第一个字母就暗示了其与 Audio 必定有关联：
+        打开 Bluedroid 代码目录，第一个文件夹的名称 audio\_a2dp\_hw第一个字母就暗示了其与 Audio 必定有关联：
 
 ```text
 <audio_a2dp_hw>   #dir
@@ -36,8 +36,6 @@
 ```cpp
 static int start_audio_datapath(struct a2dp_stream_common* common) {
   ...
-
-
   /* connect socket if not yet connected */
   if (common->audio_fd == AUDIO_SKT_DISCONNECTED) {
     common->audio_fd = skt_connect(A2DP_DATA_PATH, common->buffer_sz);
@@ -278,7 +276,7 @@ if (err == 0) {
 
 通过以上 HAL 库的使用方法印证了：hw\_device\_t 是HAL 设计最上层接口。而且能够通过强制转换获取到自定义的 gps\_device\_t，其原因是在自定义或者说是扩展 hw\_device\_t 的时候都将 hw\_device\_t 类型作为其第一个对象，其实是运用C语言结构体实现了面向对象的继承\(考虑其内存空间，是包含关系\)。
 
-如上简要介绍了 Android HAL 设计思想，现在回到A2DP上，adev\_open 将 audio\_a2dp 中的函数接口绑定到了 audio\_hw\_device 上，由此一来，在Audio 进程中通过 hw\_get\_module 等一系列方法就可以拿到 audio\_a2dp 中的函数j接口了，从而可以向 Bluetooth\_a2dp 进行：
+如上简要介绍了 Android HAL 设计思想，现在回到A2DP上，adev\_open 将 audio\_a2dp 中的函数接口绑定到了 audio\_hw\_device 上，由此一来，在Audio 进程中通过 hw\_get\_module 等一系列方法就可以拿到 audio\_a2dp 中的函数接口，从而可以向 Bluetooth\_a2dp 进行：
 
 * init\_check
 * set\_voice\_volume
@@ -534,7 +532,7 @@ static void btif_a2dp_source_setup_codec_delayed(
 
 ## 三、A2DP 编码器
 
-Android O 在 SBC 和 AAC 的基础上新增了 APTX、LDAC，并且采用 C++ 语言进行重构，使用面向对象的编程思想对编码器进行了抽象和实现。
+Android O 在 原有 SBC、AAC 的基础上新增了 APTX、LDAC，并且采用 C++ 语言进行重构，使用面向对象的编程思想对编码器进行了抽象和实现。
 
 ### 3.1 编码器抽象接口
 
@@ -1041,6 +1039,10 @@ static ssize_t out_write(struct audio_stream_out* stream, const void* buffer,
 ### 3.3 SBC 编码流程
 
 
+
+
+
+## 四、SBC 编码算法分析
 
 
 
